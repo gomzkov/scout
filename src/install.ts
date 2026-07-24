@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Scout installer. Zero dependencies. Interactive, so it stays instant on npx.
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -11,19 +10,40 @@ import type { Key } from "node:readline";
 type Scope = "global" | "project";
 type Harness = "claude" | "cursor" | "codex" | "all";
 type RunMode = "on" | "demand";
+type Command = "install" | "uninstall";
 type Roots = { home: string; cwd: string };
 type SelectOption<T> = { value: T; label: string; hint?: string };
-type HookCommand = { type: string; command: string; timeout?: number; [key: string]: unknown };
+type HookCommand = { type?: string; command?: string; [key: string]: unknown };
 type HookEntry = { hooks?: HookCommand[]; [key: string]: unknown };
 type ClaudeSettings = {
-  hooks?: { SessionStart?: HookEntry[]; [key: string]: unknown };
+  hooks?: {
+    UserPromptSubmit?: HookEntry[];
+    SessionStart?: HookEntry[];
+    [key: string]: unknown;
+  };
   [key: string]: unknown;
 };
 type PackageMetadata = { version: string };
+type CliOptions = {
+  command: Command;
+  harness?: Harness;
+  scope?: Scope;
+  mode?: RunMode;
+  yes: boolean;
+};
 
-const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const USER_HOME = os.homedir();
-const META = JSON.parse(fs.readFileSync(path.join(PKG, "package.json"), "utf8")) as PackageMetadata;
+const META = JSON.parse(
+  fs.readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8"),
+) as PackageMetadata;
+const SLUG = "scout";
+const DISPLAY_NAME = "Scout";
+const CODEX_START = "<!-- scout:start -->";
+const CODEX_END = "<!-- scout:end -->";
+const CODEX_INSTRUCTION =
+  "After fully answering, silently check whether the user missed a consequential, non-obvious gap that could change the outcome. If so, append `Scout:` with one short bullet labeled Risk, Ask, Lens, Direction, or Opportunity. Add a second only when it is distinct and equally consequential. Skip routine work, diagnostics where the diagnosis is already the answer, obvious advice, weak speculation, repeats, and anything the answer already covers. No value means no Scout block.";
+const CODEX_BLOCK = `${CODEX_START}\n## Scout\n\n${CODEX_INSTRUCTION}\n${CODEX_END}`;
 
 // ---------- style ----------
 const supportsColor = process.stdout.isTTY && process.env.NO_COLOR === undefined;
@@ -45,27 +65,34 @@ function banner(action: string) {
 function help() {
   console.log(`scout ${META.version}
 
-Install Scout for Claude Code, Cursor, or Codex.
+Surfaces the question you didn't know to ask.
 
 Usage:
   npx @gomzkov/scout
-  npx @gomzkov/scout uninstall
+  npx @gomzkov/scout install [options]
+  npx @gomzkov/scout uninstall [options]
 
 Commands:
-  uninstall        Remove Scout files and configuration
+  install                 Install Scout (default)
+  uninstall               Remove managed files and configuration
 
 Options:
-  -h, --help       Show this help
-  -v, --version    Show the installed version
-      --uninstall  Alias for the uninstall command
+  -a, --agent <agent>     claude, cursor, codex, or all
+  -s, --scope <scope>     global or project
+  -m, --mode <mode>       Claude Code: on or demand
+  -y, --yes               Confirm non-interactive uninstall
+  -h, --help              Show this help
+  -v, --version           Show the package version
 
-The interactive installer lets you choose the agent, install scope, and
-Claude Code mode. It preserves existing configuration.`);
+Without --agent and --scope, the installer opens an interactive picker.
+Non-interactive Claude Code installs also require --mode.`);
 }
 
 function requireInteractiveTerminal() {
   if (process.stdin.isTTY && process.stdout.isTTY) return true;
-  console.error("Scout uses an interactive installer. Run this command directly in a terminal.");
+  console.error(
+    "This choice needs an interactive terminal. Pass --agent and --scope to run non-interactively.",
+  );
   return false;
 }
 
@@ -164,58 +191,96 @@ function symlinkAt(targetPath: string) {
   }
 }
 
-function copy(src: string, dst: string) {
-  const parent = path.dirname(dst);
-  const scoutDirectory = path.basename(parent) === "scout" ? parent : null;
-  const conflict = symlinkAt(dst) ? dst : scoutDirectory && symlinkAt(scoutDirectory) ? scoutDirectory : null;
-  if (conflict) {
-    throw new Error(`existing symlink at ${conflict}; run Scout's uninstaller first, then retry`);
+function rejectSymlink(targetPath: string) {
+  if (symlinkAt(targetPath)) {
+    throw new Error(
+      `refusing to modify symlink at ${targetPath}; remove it or choose another scope`,
+    );
   }
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.copyFileSync(src, dst);
 }
 
-// Merge the SessionStart hook into a Claude Code settings.json without
-// clobbering the user's existing config. Idempotent.
+function writeAtomic(
+  targetPath: string,
+  content: string | Buffer,
+  mode?: number,
+) {
+  rejectSymlink(targetPath);
+  const parent = path.dirname(targetPath);
+  fs.mkdirSync(parent, { recursive: true });
+  const existingMode = fs.existsSync(targetPath)
+    ? fs.statSync(targetPath).mode & 0o777
+    : undefined;
+  const finalMode = mode ?? existingMode;
+  const temporaryPath = path.join(
+    parent,
+    `.${path.basename(targetPath)}.${process.pid}.${Date.now()}.tmp`,
+  );
+
+  try {
+    fs.writeFileSync(
+      temporaryPath,
+      content,
+      finalMode === undefined ? undefined : { mode: finalMode },
+    );
+    fs.renameSync(temporaryPath, targetPath);
+    if (finalMode !== undefined) fs.chmodSync(targetPath, finalMode);
+  } finally {
+    if (fs.existsSync(temporaryPath)) fs.rmSync(temporaryPath, { force: true });
+  }
+}
+
+function copyManaged(
+  sourcePath: string,
+  targetPath: string,
+  managedDirectory?: string,
+) {
+  if (managedDirectory) rejectSymlink(managedDirectory);
+  writeAtomic(targetPath, fs.readFileSync(sourcePath));
+}
+
+function readClaudeSettings(settingsPath: string): ClaudeSettings {
+  if (!fs.existsSync(settingsPath)) return {};
+  rejectSymlink(settingsPath);
+  const source = fs.readFileSync(settingsPath, "utf8").trim();
+  if (!source) return {};
+  try {
+    return JSON.parse(source) as ClaudeSettings;
+  } catch {
+    throw new Error(`could not parse ${settingsPath}; fix or move it and retry`);
+  }
+}
+
+function hasExactHook(entries: HookEntry[], command: string) {
+  return entries.some((entry) =>
+    Array.isArray(entry?.hooks)
+      ? entry.hooks.some(
+          (hook) => hook?.type === "command" && hook.command === command,
+        )
+      : false,
+  );
+}
+
 function addSessionStartHook(settingsPath: string, command: string) {
-  let cfg: ClaudeSettings = {};
-  if (fs.existsSync(settingsPath)) {
-    try {
-      cfg = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as ClaudeSettings;
-    } catch {
-      throw new Error(`could not parse ${settingsPath}; fix or remove it and retry`);
-    }
-  }
-  cfg.hooks ??= {};
-  cfg.hooks.SessionStart ??= [];
-  const already = JSON.stringify(cfg.hooks.SessionStart).includes(command);
-  if (!already) {
-    cfg.hooks.SessionStart.push({ hooks: [{ type: "command", command, timeout: 5 }] });
-  }
-  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + "\n");
-  return !already;
+  const config = readClaudeSettings(settingsPath);
+  config.hooks ??= {};
+  config.hooks.SessionStart ??= [];
+  if (hasExactHook(config.hooks.SessionStart, command)) return false;
+
+  config.hooks.SessionStart.push({
+    hooks: [{ type: "command", command, timeout: 5 }],
+  });
+  writeAtomic(settingsPath, `${JSON.stringify(config, null, 2)}\n`);
+  return true;
 }
 
 function removeSessionStartHook(settingsPath: string, command: string) {
   if (!fs.existsSync(settingsPath)) return false;
-  const source = fs.readFileSync(settingsPath, "utf8");
-  if (!source.includes(command)) return false;
-
-  let cfg: ClaudeSettings;
-  try {
-    cfg = JSON.parse(source) as ClaudeSettings;
-  } catch {
-    throw new Error(`could not parse ${settingsPath}; fix it and retry`);
-  }
-
-  const hooksConfig = cfg.hooks;
-  if (!hooksConfig) return false;
-  const entries = hooksConfig.SessionStart;
+  const config = readClaudeSettings(settingsPath);
+  const entries = config.hooks?.SessionStart;
   if (!Array.isArray(entries)) return false;
-  let changed = false;
-  const remaining = [];
 
+  let changed = false;
+  const remaining: HookEntry[] = [];
   for (const entry of entries) {
     if (!Array.isArray(entry?.hooks)) {
       remaining.push(entry);
@@ -223,164 +288,545 @@ function removeSessionStartHook(settingsPath: string, command: string) {
     }
 
     const hooks = entry.hooks.filter((hook) => {
-      const isScout = hook?.type === "command" && hook.command === command;
-      if (isScout) changed = true;
-      return !isScout;
+      const managed = hook?.type === "command" && hook.command === command;
+      if (managed) changed = true;
+      return !managed;
     });
 
-    if (hooks.length) remaining.push({ ...entry, hooks });
-    else if (Object.keys(entry).some((key) => key !== "hooks")) remaining.push({ ...entry, hooks });
+    if (hooks.length > 0) remaining.push({ ...entry, hooks });
+    else if (Object.keys(entry).some((key) => key !== "hooks")) {
+      remaining.push({ ...entry, hooks });
+    }
   }
 
   if (!changed) return false;
-  if (remaining.length) hooksConfig.SessionStart = remaining;
-  else delete hooksConfig.SessionStart;
-  if (!Object.keys(hooksConfig).length) delete cfg.hooks;
-  fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2) + "\n");
+  if (remaining.length > 0) config.hooks!.SessionStart = remaining;
+  else {
+    delete config.hooks!.SessionStart;
+    if (Object.keys(config.hooks!).length === 0) delete config.hooks;
+  }
+
+  if (Object.keys(config).length === 0) fs.rmSync(settingsPath, { force: true });
+  else writeAtomic(settingsPath, `${JSON.stringify(config, null, 2)}\n`);
   return true;
 }
 
-function removeFile(filePath: string, label: string, done: string[]) {
-  if (!fs.existsSync(filePath)) return false;
-  fs.unlinkSync(filePath);
-  done.push(`${label.padEnd(6)} ${dim(filePath)}`);
+function addMarkedBlock(targetPath: string) {
+  rejectSymlink(targetPath);
+  const source = fs.existsSync(targetPath)
+    ? fs.readFileSync(targetPath, "utf8")
+    : "";
+  const start = source.indexOf(CODEX_START);
+  const end = source.indexOf(CODEX_END);
+
+  if ((start === -1) !== (end === -1)) {
+    throw new Error(`found an incomplete ${DISPLAY_NAME} block in ${targetPath}`);
+  }
+
+  if (start !== -1 && end !== -1) {
+    const afterEnd = end + CODEX_END.length;
+    const next = `${source.slice(0, start)}${CODEX_BLOCK}${source.slice(afterEnd)}`;
+    if (next === source) return false;
+    writeAtomic(targetPath, next);
+    return true;
+  }
+
+  const prefix = source.trimEnd();
+  writeAtomic(targetPath, `${prefix}${prefix ? "\n\n" : ""}${CODEX_BLOCK}\n`);
   return true;
 }
 
-function removeDirectory(directoryPath: string, label: string, done: string[]) {
-  if (!fs.existsSync(directoryPath)) return false;
-  fs.rmSync(directoryPath, { recursive: true, force: true });
-  done.push(`${label.padEnd(6)} ${dim(directoryPath)}`);
+function removeMarkedBlock(targetPath: string) {
+  if (!fs.existsSync(targetPath)) return false;
+  rejectSymlink(targetPath);
+  const source = fs.readFileSync(targetPath, "utf8");
+  const start = source.indexOf(CODEX_START);
+  const end = source.indexOf(CODEX_END);
+  if (start === -1 && end === -1) return false;
+  if (start === -1 || end === -1) {
+    throw new Error(`found an incomplete ${DISPLAY_NAME} block in ${targetPath}`);
+  }
+
+  const before = source.slice(0, start).trimEnd();
+  const after = source.slice(end + CODEX_END.length).trimStart();
+  const remaining = [before, after].filter(Boolean).join("\n\n");
+  if (!remaining) fs.rmSync(targetPath, { force: true });
+  else writeAtomic(targetPath, `${remaining}\n`);
   return true;
 }
 
-function installClaudeCode(scope: Scope, alwaysOn: boolean, done: string[], roots: Roots = { home: USER_HOME, cwd: process.cwd() }) {
-  const base = scope === "global" ? path.join(roots.home, ".claude") : path.join(roots.cwd, ".claude");
-  copy(path.join(PKG, "SKILL.md"), path.join(base, "skills", "scout", "SKILL.md"));
-  done.push(`skill  ${dim(path.join(base, "skills", "scout", "SKILL.md"))}`);
-  if (alwaysOn) {
-    const hookPath = path.join(base, "hooks", "scout.sh");
-    copy(path.join(PKG, "hook", "scout.sh"), hookPath);
-    fs.chmodSync(hookPath, 0o755);
-    const changed = addSessionStartHook(path.join(base, "settings.json"), `bash ${hookPath}`);
-    done.push(`hook   ${dim(hookPath)}${changed ? "" : gray(" (already set)")}`);
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function bashPath(value: string) {
+  return value.replaceAll("\\", "/");
+}
+
+function removeManagedFile(
+  targetPath: string,
+  label: string,
+  done: string[],
+) {
+  if (!fs.existsSync(targetPath) && !symlinkAt(targetPath)) return false;
+  rejectSymlink(targetPath);
+  fs.rmSync(targetPath, { force: true });
+  done.push(`${label.padEnd(7)} ${dim(targetPath)}`);
+  return true;
+}
+
+function removeEmptyDirectory(directoryPath: string) {
+  try {
+    fs.rmdirSync(directoryPath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") {
+      throw error;
+    }
   }
 }
 
-function installCursor(scope: Scope, done: string[], roots: Roots = { home: USER_HOME, cwd: process.cwd() }) {
-  if (scope === "global") {
-    const dst = path.join(roots.home, ".cursor", "skills", "scout", "SKILL.md");
-    copy(path.join(PKG, "SKILL.md"), dst);
-    done.push(`skill  ${dim(dst)}`);
-    return;
-  }
-
-  const dst = path.join(roots.cwd, ".cursor", "rules", "scout.mdc");
-  copy(path.join(PKG, "cursor", "scout.mdc"), dst);
-  done.push(`rule   ${dim(dst)}`);
-}
-
-function installCodex(scope: Scope, done: string[], roots: Roots = { home: USER_HOME, cwd: process.cwd() }) {
-  const base = scope === "global" ? path.join(roots.home, ".agents") : path.join(roots.cwd, ".agents");
-  copy(path.join(PKG, "SKILL.md"), path.join(base, "skills", "scout", "SKILL.md"));
-  done.push(`skill  ${dim(path.join(base, "skills", "scout", "SKILL.md"))}`);
-}
-
-function uninstallClaudeCode(scope: Scope, done: string[], roots: Roots = { home: USER_HOME, cwd: process.cwd() }) {
-  const base = scope === "global" ? path.join(roots.home, ".claude") : path.join(roots.cwd, ".claude");
-  const hookPath = path.join(base, "hooks", "scout.sh");
+function installClaudeCode(
+  scope: Scope,
+  alwaysOn: boolean,
+  done: string[],
+  roots: Roots = { home: USER_HOME, cwd: process.cwd() },
+) {
+  const base =
+    scope === "global"
+      ? path.join(roots.home, ".claude")
+      : path.join(roots.cwd, ".claude");
   const settingsPath = path.join(base, "settings.json");
-  if (removeSessionStartHook(settingsPath, `bash ${hookPath}`)) {
-    done.push(`config ${dim(settingsPath)}`);
+  readClaudeSettings(settingsPath);
+
+  const skillDirectory = path.join(base, "skills", SLUG);
+  const skillPath = path.join(skillDirectory, "SKILL.md");
+  copyManaged(
+    path.join(PACKAGE_ROOT, "SKILL.md"),
+    skillPath,
+    skillDirectory,
+  );
+  done.push(`skill   ${dim(skillPath)}`);
+
+  const hookPath = path.join(base, "hooks", `${SLUG}.sh`);
+  const command = `bash ${shellQuote(bashPath(hookPath))}`;
+  const legacyCommand = `bash ${hookPath}`;
+
+  if (alwaysOn) {
+    copyManaged(
+      path.join(PACKAGE_ROOT, "hook", `${SLUG}.sh`),
+      hookPath,
+    );
+    fs.chmodSync(hookPath, 0o755);
+    done.push(`hook    ${dim(hookPath)}`);
+
+    const migrated =
+      legacyCommand === command
+        ? false
+        : removeSessionStartHook(settingsPath, legacyCommand);
+    const changed = addSessionStartHook(settingsPath, command);
+    done.push(
+      `config  ${dim(settingsPath)}${changed || migrated ? "" : gray(" (already set)")}`,
+    );
+  } else {
+    const removedCurrent = removeSessionStartHook(settingsPath, command);
+    const removedLegacy =
+      legacyCommand !== command &&
+      removeSessionStartHook(settingsPath, legacyCommand);
+    if (removedCurrent || removedLegacy) {
+      done.push(`config  ${dim(settingsPath)}`);
+    }
+    removeManagedFile(hookPath, "hook", done);
+    removeEmptyDirectory(path.dirname(hookPath));
   }
-  removeDirectory(path.join(base, "skills", "scout"), "skill", done);
-  removeFile(hookPath, "hook", done);
 }
 
-function uninstallCursor(scope: Scope, done: string[], roots: Roots = { home: USER_HOME, cwd: process.cwd() }) {
-  if (scope === "global") {
-    removeDirectory(path.join(roots.home, ".cursor", "skills", "scout"), "skill", done);
-    return;
+function installCursor(
+  scope: Scope,
+  done: string[],
+  roots: Roots = { home: USER_HOME, cwd: process.cwd() },
+) {
+  const base =
+    scope === "global"
+      ? path.join(roots.home, ".cursor")
+      : path.join(roots.cwd, ".cursor");
+  const skillDirectory = path.join(base, "skills", SLUG);
+  const skillPath = path.join(skillDirectory, "SKILL.md");
+  copyManaged(
+    path.join(PACKAGE_ROOT, "SKILL.md"),
+    skillPath,
+    skillDirectory,
+  );
+  done.push(`skill   ${dim(skillPath)}`);
+
+  if (scope === "project") {
+    const rulePath = path.join(base, "rules", `${SLUG}.mdc`);
+    copyManaged(
+      path.join(PACKAGE_ROOT, "cursor", `${SLUG}.mdc`),
+      rulePath,
+    );
+    done.push(`rule    ${dim(rulePath)}`);
   }
-  removeFile(path.join(roots.cwd, ".cursor", "rules", "scout.mdc"), "rule", done);
 }
 
-function uninstallCodex(scope: Scope, done: string[], roots: Roots = { home: USER_HOME, cwd: process.cwd() }) {
-  const base = scope === "global" ? path.join(roots.home, ".agents") : path.join(roots.cwd, ".agents");
-  removeDirectory(path.join(base, "skills", "scout"), "skill", done);
+function installCodex(
+  scope: Scope,
+  done: string[],
+  roots: Roots = { home: USER_HOME, cwd: process.cwd() },
+) {
+  const skillBase =
+    scope === "global"
+      ? path.join(roots.home, ".agents")
+      : path.join(roots.cwd, ".agents");
+  const skillDirectory = path.join(skillBase, "skills", SLUG);
+  const skillPath = path.join(skillDirectory, "SKILL.md");
+  copyManaged(
+    path.join(PACKAGE_ROOT, "SKILL.md"),
+    skillPath,
+    skillDirectory,
+  );
+  done.push(`skill   ${dim(skillPath)}`);
+
+  const agentsPath =
+    scope === "global"
+      ? path.join(roots.home, ".codex", "AGENTS.md")
+      : path.join(roots.cwd, "AGENTS.md");
+  const changed = addMarkedBlock(agentsPath);
+  done.push(
+    `agents  ${dim(agentsPath)}${changed ? "" : gray(" (already set)")}`,
+  );
 }
 
-// ---------- self test ----------
+function uninstallClaudeCode(
+  scope: Scope,
+  done: string[],
+  roots: Roots = { home: USER_HOME, cwd: process.cwd() },
+) {
+  const base =
+    scope === "global"
+      ? path.join(roots.home, ".claude")
+      : path.join(roots.cwd, ".claude");
+  const hookPath = path.join(base, "hooks", `${SLUG}.sh`);
+  const settingsPath = path.join(base, "settings.json");
+  const command = `bash ${shellQuote(bashPath(hookPath))}`;
+  const legacyCommand = `bash ${hookPath}`;
+
+  const removedCurrent = removeSessionStartHook(settingsPath, command);
+  const removedLegacy =
+    legacyCommand !== command &&
+    removeSessionStartHook(settingsPath, legacyCommand);
+  if (removedCurrent || removedLegacy) {
+    done.push(`config  ${dim(settingsPath)}`);
+  }
+
+  const skillDirectory = path.join(base, "skills", SLUG);
+  removeManagedFile(path.join(skillDirectory, "SKILL.md"), "skill", done);
+  removeEmptyDirectory(skillDirectory);
+  removeEmptyDirectory(path.dirname(skillDirectory));
+  removeManagedFile(hookPath, "hook", done);
+  removeEmptyDirectory(path.dirname(hookPath));
+  removeEmptyDirectory(base);
+}
+
+function uninstallCursor(
+  scope: Scope,
+  done: string[],
+  roots: Roots = { home: USER_HOME, cwd: process.cwd() },
+) {
+  const base =
+    scope === "global"
+      ? path.join(roots.home, ".cursor")
+      : path.join(roots.cwd, ".cursor");
+  const skillDirectory = path.join(base, "skills", SLUG);
+  removeManagedFile(path.join(skillDirectory, "SKILL.md"), "skill", done);
+  removeEmptyDirectory(skillDirectory);
+  removeEmptyDirectory(path.dirname(skillDirectory));
+
+  if (scope === "project") {
+    const rulePath = path.join(base, "rules", `${SLUG}.mdc`);
+    removeManagedFile(rulePath, "rule", done);
+    removeEmptyDirectory(path.dirname(rulePath));
+  }
+  removeEmptyDirectory(base);
+}
+
+function uninstallCodex(
+  scope: Scope,
+  done: string[],
+  roots: Roots = { home: USER_HOME, cwd: process.cwd() },
+) {
+  const skillBase =
+    scope === "global"
+      ? path.join(roots.home, ".agents")
+      : path.join(roots.cwd, ".agents");
+  const skillDirectory = path.join(skillBase, "skills", SLUG);
+  removeManagedFile(path.join(skillDirectory, "SKILL.md"), "skill", done);
+  removeEmptyDirectory(skillDirectory);
+  removeEmptyDirectory(path.dirname(skillDirectory));
+  removeEmptyDirectory(skillBase);
+
+  const agentsPath =
+    scope === "global"
+      ? path.join(roots.home, ".codex", "AGENTS.md")
+      : path.join(roots.cwd, "AGENTS.md");
+  if (removeMarkedBlock(agentsPath)) {
+    done.push(`agents  ${dim(agentsPath)}`);
+  }
+  if (scope === "global") removeEmptyDirectory(path.dirname(agentsPath));
+}
+
+function countOccurrences(source: string, value: string) {
+  return source.split(value).length - 1;
+}
+
 function selftest() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "scout-selftest-"));
-  const roots = { home: path.join(root, "home"), cwd: path.join(root, "project") };
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${SLUG}-selftest-`));
+  const roots = {
+    home: path.join(root, "home with spaces"),
+    cwd: path.join(root, "project with spaces"),
+  };
   const expect = (condition: unknown, message: string) => {
     if (!condition) throw new Error(`selftest failed: ${message}`);
   };
 
   try {
-    const settings = path.join(roots.home, ".claude", "settings.json");
-    fs.mkdirSync(path.dirname(settings), { recursive: true });
+    const globalSettings = path.join(
+      roots.home,
+      ".claude",
+      "settings.json",
+    );
+    const globalHookPath = path.join(
+      roots.home,
+      ".claude",
+      "hooks",
+      `${SLUG}.sh`,
+    );
+    const legacyCommand = `bash ${globalHookPath}`;
+    fs.mkdirSync(path.dirname(globalSettings), { recursive: true });
     fs.writeFileSync(
-      settings,
-      JSON.stringify({
-        model: "opus",
-        hooks: {
-          UserPromptSubmit: [{ hooks: [] }],
-          SessionStart: [{ hooks: [{ type: "command", command: "echo existing", timeout: 5 }] }],
+      globalSettings,
+      `${JSON.stringify(
+        {
+          model: "opus",
+          hooks: {
+            UserPromptSubmit: [{ hooks: [] }],
+            SessionStart: [
+              {
+                hooks: [
+                  { type: "command", command: "echo existing", timeout: 5 },
+                ],
+              },
+              {
+                hooks: [
+                  { type: "command", command: legacyCommand, timeout: 5 },
+                ],
+              },
+            ],
+          },
         },
-      }),
+        null,
+        2,
+      )}\n`,
     );
 
-    installClaudeCode("global", true, [], roots);
-    installClaudeCode("global", true, [], roots);
-    installClaudeCode("project", true, [], roots);
-    installCursor("global", [], roots);
-    installCursor("project", [], roots);
-    installCodex("global", [], roots);
-    installCodex("project", [], roots);
+    const globalAgents = path.join(roots.home, ".codex", "AGENTS.md");
+    const projectAgents = path.join(roots.cwd, "AGENTS.md");
+    fs.mkdirSync(path.dirname(globalAgents), { recursive: true });
+    fs.mkdirSync(path.dirname(projectAgents), { recursive: true });
+    fs.writeFileSync(globalAgents, "# Existing global guidance\n");
+    fs.writeFileSync(projectAgents, "# Existing project guidance\n");
 
-    const cfg = JSON.parse(fs.readFileSync(settings, "utf8"));
-    const hook = spawnSync("bash", [path.join(PKG, "hook", "scout.sh")], { encoding: "utf8" });
-    const hookOutput = JSON.parse(hook.stdout);
-    expect(cfg.model === "opus", "Claude settings were not preserved");
-    expect(cfg.hooks.UserPromptSubmit.length === 1, "existing Claude hooks were not preserved");
-    expect(cfg.hooks.SessionStart.length === 2, "Claude hook installation is not idempotent");
-    expect(fs.existsSync(path.join(roots.home, ".claude", "skills", "scout", "SKILL.md")), "Claude skill missing");
-    expect(fs.existsSync(path.join(roots.cwd, ".claude", "skills", "scout", "SKILL.md")), "project Claude skill missing");
-    expect(fs.existsSync(path.join(roots.home, ".cursor", "skills", "scout", "SKILL.md")), "global Cursor skill missing");
-    expect(fs.existsSync(path.join(roots.cwd, ".cursor", "rules", "scout.mdc")), "Cursor rule missing");
-    expect(fs.existsSync(path.join(roots.home, ".agents", "skills", "scout", "SKILL.md")), "global Codex skill missing");
-    expect(fs.existsSync(path.join(roots.cwd, ".agents", "skills", "scout", "SKILL.md")), "project Codex skill missing");
+    for (const scope of ["global", "project"] as const) {
+      installClaudeCode(scope, true, [], roots);
+      installClaudeCode(scope, true, [], roots);
+      installCursor(scope, [], roots);
+      installCursor(scope, [], roots);
+      installCodex(scope, [], roots);
+      installCodex(scope, [], roots);
+    }
+
+    const settings = JSON.parse(
+      fs.readFileSync(globalSettings, "utf8"),
+    ) as ClaudeSettings;
+    expect(settings.model === "opus", "Claude settings were not preserved");
+    expect(
+      settings.hooks?.UserPromptSubmit?.length === 1,
+      "existing Claude hooks were not preserved",
+    );
+    expect(
+      settings.hooks?.SessionStart?.length === 2,
+      "Claude hook installation is not idempotent",
+    );
+    const installedCommand =
+      settings.hooks?.SessionStart?.[1]?.hooks?.[0]?.command;
+    expect(
+      installedCommand === `bash ${shellQuote(bashPath(globalHookPath))}`,
+      "Claude hook path was not safely quoted",
+    );
+    expect(
+      installedCommand !== legacyCommand,
+      "legacy Claude hook command was not migrated",
+    );
+
+    for (const base of [
+      path.join(roots.home, ".claude"),
+      path.join(roots.cwd, ".claude"),
+      path.join(roots.home, ".cursor"),
+      path.join(roots.cwd, ".cursor"),
+      path.join(roots.home, ".agents"),
+      path.join(roots.cwd, ".agents"),
+    ]) {
+      expect(
+        fs.existsSync(path.join(base, "skills", SLUG, "SKILL.md")),
+        `skill missing under ${base}`,
+      );
+    }
+
+    expect(
+      fs.existsSync(
+        path.join(roots.cwd, ".cursor", "rules", `${SLUG}.mdc`),
+      ),
+      "Cursor project rule missing",
+    );
+    expect(
+      !fs.existsSync(
+        path.join(roots.home, ".cursor", "rules", `${SLUG}.mdc`),
+      ),
+      "unsupported global Cursor rule was installed",
+    );
+    expect(
+      countOccurrences(fs.readFileSync(globalAgents, "utf8"), CODEX_START) ===
+        1,
+      "global Codex block is not idempotent",
+    );
+    expect(
+      countOccurrences(fs.readFileSync(projectAgents, "utf8"), CODEX_START) ===
+        1,
+      "project Codex block is not idempotent",
+    );
+
+    const hookPath = path.join(PACKAGE_ROOT, "hook", `${SLUG}.sh`);
+    const hook = spawnSync("bash", [hookPath], { encoding: "utf8" });
+    const mutedHook = spawnSync("bash", [hookPath], {
+      encoding: "utf8",
+      env: { ...process.env, SCOUT_DISABLE: "1" },
+    });
     expect(hook.status === 0, "Claude hook did not exit cleanly");
-    expect(hookOutput.hookSpecificOutput?.hookEventName === "SessionStart", "Claude hook output is invalid");
+    expect(mutedHook.status === 0, "muted Claude hook did not exit cleanly");
+    expect(mutedHook.stdout === "", "SCOUT_DISABLE did not mute the hook");
+    const hookOutput = JSON.parse(hook.stdout || "{}") as {
+      hookSpecificOutput?: {
+        hookEventName?: string;
+        additionalContext?: string;
+      };
+    };
+    expect(
+      hookOutput.hookSpecificOutput?.hookEventName === "SessionStart",
+      "Claude hook output has the wrong event",
+    );
+    expect(
+      hookOutput.hookSpecificOutput?.additionalContext?.includes("Scout:"),
+      "Claude hook output is missing the instruction",
+    );
 
-    uninstallClaudeCode("global", [], roots);
-    uninstallClaudeCode("global", [], roots);
-    uninstallClaudeCode("project", [], roots);
-    uninstallCursor("global", [], roots);
-    uninstallCursor("project", [], roots);
-    uninstallCodex("global", [], roots);
-    uninstallCodex("project", [], roots);
+    const installOptions = parseOptions([
+      "install",
+      "--agent",
+      "all",
+      "--scope",
+      "global",
+      "--mode",
+      "on",
+    ]);
+    expect(
+      installOptions.command === "install" &&
+        installOptions.harness === "all" &&
+        installOptions.scope === "global" &&
+        installOptions.mode === "on",
+      "non-interactive install options were not parsed",
+    );
+    const uninstallOptions = parseOptions([
+      "remove",
+      "-a",
+      "codex",
+      "-s",
+      "project",
+      "-y",
+    ]);
+    expect(
+      uninstallOptions.command === "uninstall" &&
+        uninstallOptions.harness === "codex" &&
+        uninstallOptions.scope === "project" &&
+        uninstallOptions.yes,
+      "non-interactive uninstall options were not parsed",
+    );
 
-    const cleaned = JSON.parse(fs.readFileSync(settings, "utf8"));
-    expect(cleaned.model === "opus", "Claude settings changed during uninstall");
-    expect(cleaned.hooks.UserPromptSubmit.length === 1, "existing Claude hooks were removed");
-    expect(cleaned.hooks.SessionStart.length === 1, "Scout hook was not removed cleanly");
-    expect(cleaned.hooks.SessionStart[0].hooks[0].command === "echo existing", "another SessionStart hook was changed");
-    expect(!fs.existsSync(path.join(roots.home, ".claude", "skills", "scout")), "global Claude skill was not removed");
-    expect(!fs.existsSync(path.join(roots.cwd, ".claude", "skills", "scout")), "project Claude skill was not removed");
-    expect(!fs.existsSync(path.join(roots.home, ".claude", "hooks", "scout.sh")), "global Claude hook was not removed");
-    expect(!fs.existsSync(path.join(roots.cwd, ".claude", "hooks", "scout.sh")), "project Claude hook was not removed");
-    expect(!fs.existsSync(path.join(roots.home, ".cursor", "skills", "scout")), "global Cursor skill was not removed");
-    expect(!fs.existsSync(path.join(roots.cwd, ".cursor", "rules", "scout.mdc")), "Cursor rule was not removed");
-    expect(!fs.existsSync(path.join(roots.home, ".agents", "skills", "scout")), "global Codex skill was not removed");
-    expect(!fs.existsSync(path.join(roots.cwd, ".agents", "skills", "scout")), "project Codex skill was not removed");
+    for (const scope of ["global", "project"] as const) {
+      uninstallClaudeCode(scope, [], roots);
+      uninstallClaudeCode(scope, [], roots);
+      uninstallCursor(scope, [], roots);
+      uninstallCursor(scope, [], roots);
+      uninstallCodex(scope, [], roots);
+      uninstallCodex(scope, [], roots);
+    }
+
+    const cleanedSettings = JSON.parse(
+      fs.readFileSync(globalSettings, "utf8"),
+    ) as ClaudeSettings;
+    expect(
+      cleanedSettings.model === "opus",
+      "Claude settings changed during uninstall",
+    );
+    expect(
+      cleanedSettings.hooks?.UserPromptSubmit?.length === 1,
+      "existing Claude hook was removed",
+    );
+    expect(
+      cleanedSettings.hooks?.SessionStart?.length === 1 &&
+        cleanedSettings.hooks.SessionStart[0]?.hooks?.[0]?.command ===
+          "echo existing",
+      "managed Claude hook was not removed cleanly",
+    );
+    expect(
+      fs.readFileSync(globalAgents, "utf8") ===
+        "# Existing global guidance\n",
+      "global AGENTS.md content changed during uninstall",
+    );
+    expect(
+      fs.readFileSync(projectAgents, "utf8") ===
+        "# Existing project guidance\n",
+      "project AGENTS.md content changed during uninstall",
+    );
+    expect(
+      !fs.existsSync(path.join(roots.cwd, ".claude")),
+      "empty project Claude directory was left behind",
+    );
+    expect(
+      !fs.existsSync(path.join(roots.cwd, ".cursor")),
+      "empty project Cursor directory was left behind",
+    );
+    expect(
+      !fs.existsSync(path.join(roots.cwd, ".agents")),
+      "empty project Codex skill directory was left behind",
+    );
+
+    installClaudeCode("global", false, [], roots);
+    expect(
+      !fs.existsSync(globalHookPath),
+      "on-demand Claude install unexpectedly created a hook",
+    );
+    uninstallClaudeCode("global", [], roots);
 
     const externalSkill = path.join(root, "external-scout");
-    const scoutLink = path.join(roots.home, ".claude", "skills", "scout");
+    const scoutLink = path.join(
+      roots.home,
+      ".claude",
+      "skills",
+      SLUG,
+    );
     fs.mkdirSync(externalSkill, { recursive: true });
     fs.writeFileSync(path.join(externalSkill, "SKILL.md"), "original\n");
+    fs.mkdirSync(path.dirname(scoutLink), { recursive: true });
     fs.symlinkSync(externalSkill, scoutLink, "dir");
     let symlinkError: unknown;
     try {
@@ -388,8 +834,16 @@ function selftest() {
     } catch (error) {
       symlinkError = error;
     }
-    expect(symlinkError instanceof Error && symlinkError.message.includes("existing symlink"), "existing skill symlink was not rejected");
-    expect(fs.readFileSync(path.join(externalSkill, "SKILL.md"), "utf8") === "original\n", "symlink target was overwritten");
+    expect(
+      symlinkError instanceof Error &&
+        symlinkError.message.includes("refusing to modify symlink"),
+      "existing skill symlink was not rejected",
+    );
+    expect(
+      fs.readFileSync(path.join(externalSkill, "SKILL.md"), "utf8") ===
+        "original\n",
+      "symlink target was overwritten",
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -397,144 +851,244 @@ function selftest() {
   console.log("selftest ok");
 }
 
-// ---------- uninstall ----------
-async function uninstall() {
-  if (!requireInteractiveTerminal()) {
-    process.exitCode = 1;
-    return;
-  }
-  banner("Remove Scout from an AI coding agent");
+function parseOptions(args: string[]): CliOptions {
+  let command: Command = "install";
+  let harness: Harness | undefined;
+  let scope: Scope | undefined;
+  let mode: RunMode | undefined;
+  let yes = false;
+  let index = 0;
 
-  const harness = await select<Harness>("Which agent are you removing Scout from?", [
-    { value: "claude", label: "Claude Code", hint: "skill + always-on hook" },
-    { value: "cursor", label: "Cursor", hint: "personal skill or project rule" },
-    { value: "codex", label: "Codex", hint: "skill" },
+  if (args[0] === "install") index += 1;
+  else if (
+    args[0] === "uninstall" ||
+    args[0] === "remove" ||
+    args[0] === "--uninstall"
+  ) {
+    command = "uninstall";
+    index += 1;
+  }
+
+  while (index < args.length) {
+    const argument = args[index];
+    if (argument === "--agent" || argument === "-a") {
+      const value = args[index + 1];
+      if (!["claude", "cursor", "codex", "all"].includes(value || "")) {
+        throw new Error("--agent must be claude, cursor, codex, or all");
+      }
+      harness = value as Harness;
+      index += 2;
+    } else if (argument === "--scope" || argument === "-s") {
+      const value = args[index + 1];
+      if (value !== "global" && value !== "project") {
+        throw new Error("--scope must be global or project");
+      }
+      scope = value;
+      index += 2;
+    } else if (argument === "--mode" || argument === "-m") {
+      const value = args[index + 1];
+      if (value !== "on" && value !== "demand") {
+        throw new Error("--mode must be on or demand");
+      }
+      mode = value;
+      index += 2;
+    } else if (argument === "--yes" || argument === "-y") {
+      yes = true;
+      index += 1;
+    } else {
+      throw new Error(`unknown option: ${argument}`);
+    }
+  }
+
+  return {
+    command,
+    ...(harness === undefined ? {} : { harness }),
+    ...(scope === undefined ? {} : { scope }),
+    ...(mode === undefined ? {} : { mode }),
+    yes,
+  };
+}
+
+async function chooseHarness(current?: Harness): Promise<Harness> {
+  if (current) return current;
+  if (!requireInteractiveTerminal()) throw new Error("agent choice required");
+  return select<Harness>(`Which agent should use ${DISPLAY_NAME}?`, [
+    { value: "claude", label: "Claude Code", hint: "skill + optional always-on hook" },
+    { value: "cursor", label: "Cursor", hint: "skill + project rule" },
+    { value: "codex", label: "Codex", hint: "skill + AGENTS.md instruction" },
     { value: "all", label: "All of them" },
   ]);
+}
 
-  const scope = await select<Scope>("Remove it from where?", [
+async function chooseScope(current?: Scope): Promise<Scope> {
+  if (current) return current;
+  if (!requireInteractiveTerminal()) throw new Error("scope choice required");
+  return select<Scope>("Which scope?", [
     { value: "global", label: "Globally", hint: "every project on this machine" },
     { value: "project", label: "This project only", hint: process.cwd() },
   ]);
+}
 
-  const target: Record<Harness, string> = {
-    all: "all agents",
-    claude: "Claude Code",
-    cursor: "Cursor",
-    codex: "Codex",
-  };
-  const location = scope === "global" ? "this machine" : "this project";
-  const confirmed = await select<boolean>(`Remove Scout from ${target[harness]} on ${location}?`, [
-    { value: false, label: "Cancel", hint: "keep Scout installed" },
-    { value: true, label: "Uninstall Scout", hint: "remove only Scout files and configuration" },
+async function chooseMode(
+  current: RunMode | undefined,
+  harness: Harness,
+): Promise<RunMode> {
+  const includesClaude = harness === "claude" || harness === "all";
+  if (!includesClaude) {
+    if (current) throw new Error("--mode only applies to Claude Code");
+    return "demand";
+  }
+  if (current) return current;
+  if (!requireInteractiveTerminal()) {
+    throw new Error("Claude Code mode required; pass --mode on or demand");
+  }
+  return select<RunMode>("How should Scout run in Claude Code?", [
+    { value: "on", label: "Always on", hint: "applies every session" },
+    { value: "demand", label: "On demand", hint: "type /scout when you want it" },
   ]);
+}
 
-  if (!confirmed) {
-    console.log("  " + gray("Scout was not removed."));
-    console.log("");
+async function install(options: CliOptions) {
+  banner("Install for Claude Code, Cursor, or Codex");
+  const harness = await chooseHarness(options.harness);
+  const scope = await chooseScope(options.scope);
+  const mode = await chooseMode(options.mode, harness);
+  const operation = spinner(`Installing ${DISPLAY_NAME}...`);
+  const done: string[] = [];
+
+  try {
+    if (harness === "claude" || harness === "all") {
+      installClaudeCode(scope, mode === "on", done);
+    }
+    if (harness === "cursor" || harness === "all") {
+      installCursor(scope, done);
+    }
+    if (harness === "codex" || harness === "all") {
+      installCodex(scope, done);
+    }
+    operation.stop(true, `${DISPLAY_NAME} installed`);
+  } catch (error) {
+    operation.stop(false, "Install failed");
+    console.log(
+      `  ${red(error instanceof Error ? error.message : String(error))}\n`,
+    );
+    process.exitCode = 1;
     return;
   }
 
   console.log("");
-  const sp = spinner("Removing Scout...");
-  const done: string[] = [];
-  try {
-    if (harness === "claude" || harness === "all") uninstallClaudeCode(scope, done);
-    if (harness === "cursor" || harness === "all") uninstallCursor(scope, done);
-    if (harness === "codex" || harness === "all") uninstallCodex(scope, done);
-    sp.stop(true, done.length ? "Scout uninstalled" : "Scout was not installed here");
-  } catch (error) {
-    sp.stop(false, "Uninstall failed");
-    console.log("  " + red(error instanceof Error ? error.message : String(error)));
-    process.exitCode = 1;
-    return;
-  }
+  done.forEach((item) => console.log(`  ${green("+")} ${item}`));
+  console.log("");
+  console.log(`  ${bold("Next:")}`);
 
-  if (done.length) {
-    console.log("");
-    done.forEach((item) => console.log("  " + gray("−") + " " + item));
-    console.log("");
-    console.log("  " + gray("Restart any open agent sessions to finish."));
+  if (harness === "claude" && mode === "on") {
+    console.log(`  ${gray("Start a new Claude Code session. Scout runs automatically.")}`);
+  } else if (harness === "claude") {
+    console.log(`  ${gray("Start a new Claude Code session. Use ")}${accent("/scout")}${gray(" or let Claude match the skill.")}`);
+  } else if (harness === "cursor" && scope === "project") {
+    console.log(`  ${gray("Start a new Cursor chat. The project rule applies automatically.")}`);
+  } else if (harness === "cursor") {
+    console.log(`  ${gray("Start a new Cursor chat. Use ")}${accent("/scout")}${gray(" or let Cursor match the skill.")}`);
+  } else if (harness === "codex") {
+    console.log(`  ${gray("Start a new Codex task. The AGENTS.md instruction applies automatically.")}`);
+  } else {
+    console.log(`  ${gray("Restart open agent sessions so they load Scout.")}`);
   }
   console.log("");
 }
 
-// ---------- main ----------
+async function uninstall(options: CliOptions) {
+  if (options.mode) throw new Error("--mode only applies to install");
+  banner("Remove from Claude Code, Cursor, or Codex");
+  const harness = await chooseHarness(options.harness);
+  const scope = await chooseScope(options.scope);
+
+  if (!options.yes) {
+    if (!requireInteractiveTerminal()) {
+      throw new Error("non-interactive uninstall requires --yes");
+    }
+    const target =
+      harness === "all"
+        ? "all agents"
+        : harness === "claude"
+          ? "Claude Code"
+          : harness === "cursor"
+            ? "Cursor"
+            : "Codex";
+    const location =
+      scope === "global" ? "this machine" : "this project";
+    const confirmed = await select<boolean>(
+      `Remove ${DISPLAY_NAME} from ${target} on ${location}?`,
+      [
+        { value: false, label: "Cancel", hint: "keep Scout installed" },
+        {
+          value: true,
+          label: `Uninstall ${DISPLAY_NAME}`,
+          hint: "remove only managed files and configuration",
+        },
+      ],
+    );
+    if (!confirmed) {
+      console.log(`  ${gray(`${DISPLAY_NAME} was not removed.`)}\n`);
+      return;
+    }
+  }
+
+  const operation = spinner(`Removing ${DISPLAY_NAME}...`);
+  const done: string[] = [];
+  try {
+    if (harness === "claude" || harness === "all") {
+      uninstallClaudeCode(scope, done);
+    }
+    if (harness === "cursor" || harness === "all") {
+      uninstallCursor(scope, done);
+    }
+    if (harness === "codex" || harness === "all") {
+      uninstallCodex(scope, done);
+    }
+    operation.stop(
+      true,
+      done.length > 0
+        ? `${DISPLAY_NAME} uninstalled`
+        : `${DISPLAY_NAME} was not installed here`,
+    );
+  } catch (error) {
+    operation.stop(false, "Uninstall failed");
+    console.log(
+      `  ${red(error instanceof Error ? error.message : String(error))}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  if (done.length > 0) {
+    console.log("");
+    done.forEach((item) => console.log(`  ${gray("−")} ${item}`));
+    console.log("");
+    console.log(`  ${gray("Restart open agent sessions to finish.")}`);
+  }
+  console.log("");
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--selftest")) return selftest();
   if (args.includes("--help") || args.includes("-h")) return help();
-  if (args.includes("--version") || args.includes("-v")) return console.log(META.version);
-  if (args.length === 1 && (args[0] === "uninstall" || args[0] === "--uninstall")) return uninstall();
-  if (args.length) {
-    console.error(`Unknown option: ${args[0]}\nRun with --help to see supported options.`);
-    process.exitCode = 1;
+  if (args.includes("--version") || args.includes("-v")) {
+    console.log(META.version);
     return;
   }
 
-  if (!requireInteractiveTerminal()) {
-    process.exitCode = 1;
-    return;
-  }
-
-  banner("Install for Claude Code, Cursor, or Codex");
-
-  const harness = await select<Harness>("Which agent are you installing Scout for?", [
-    { value: "claude", label: "Claude Code", hint: "skill + optional always-on hook" },
-    { value: "cursor", label: "Cursor", hint: "personal skill or project rule" },
-    { value: "codex", label: "Codex", hint: "skill" },
-    { value: "all", label: "All of them" },
-  ]);
-
-  const scope = await select<Scope>("Install where?", [
-    { value: "global", label: "Globally", hint: "every project on this machine" },
-    { value: "project", label: "This project only", hint: process.cwd() },
-  ]);
-
-  let alwaysOn = false;
-  if (harness === "claude" || harness === "all") {
-    alwaysOn =
-      (await select<RunMode>("How should Scout run in Claude Code?", [
-        { value: "on", label: "Always on", hint: "applies every session, one cheap injection" },
-        { value: "demand", label: "On demand", hint: "type /scout when you want it" },
-      ])) === "on";
-  }
-
-  console.log("");
-  const sp = spinner("Installing Scout...");
-  const done: string[] = [];
   try {
-    if (harness === "claude" || harness === "all") installClaudeCode(scope, alwaysOn, done);
-    if (harness === "cursor" || harness === "all") installCursor(scope, done);
-    if (harness === "codex" || harness === "all") installCodex(scope, done);
-    sp.stop(true, "Scout installed");
+    const options = parseOptions(args);
+    if (options.command === "uninstall") await uninstall(options);
+    else await install(options);
   } catch (error) {
-    sp.stop(false, "Install failed");
-    console.log("  " + red(error instanceof Error ? error.message : String(error)));
-    process.exit(1);
+    console.error(
+      `error: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    process.exitCode = 1;
   }
-
-  console.log("");
-  done.forEach((d) => console.log("  " + green("+") + " " + d));
-  console.log("");
-  console.log("  " + bold("Next:"));
-  if (harness === "cursor" && scope === "project") {
-    console.log("  " + gray("Cursor applies the project rule automatically. Just start working."));
-  } else if (harness === "cursor") {
-    console.log("  " + gray("Type ") + accent("/scout") + gray(" to invoke it, or let Cursor match it automatically."));
-  } else if (harness === "all") {
-    console.log("  " + gray(`Claude Code: ${alwaysOn ? "active next session" : "type /scout or use automatic matching"}`));
-    console.log("  " + gray(`Cursor: ${scope === "project" ? "project rule active automatically" : "type /scout or use automatic matching"}`));
-    console.log("  " + gray("Codex: type $scout or use automatic matching"));
-  } else if (alwaysOn) {
-    console.log("  " + gray("Scout is active in your next session. No command needed."));
-  } else if (harness === "codex") {
-    console.log("  " + gray("Type ") + accent("$scout") + gray(" to invoke it, or let Codex match it automatically."));
-  } else {
-    console.log("  " + gray("Type ") + accent("/scout") + gray(" while exploring, or let Claude match it automatically."));
-  }
-  console.log("  " + gray("Tune it anytime in the installed ") + "SKILL.md" + gray("."));
-  console.log("");
 }
 
-main();
+await main();
