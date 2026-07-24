@@ -5,15 +5,16 @@
 
   <p>
     <a href="https://www.npmjs.com/package/@gomzkov/scout"><img src="https://img.shields.io/npm/v/@gomzkov/scout.svg" alt="npm version"></a>
+    <a href="https://github.com/gomzkov/scout/actions/workflows/ci.yml"><img src="https://github.com/gomzkov/scout/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-    <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg" alt="Node.js 18 or newer"></a>
+    <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg" alt="Node.js 22 or newer"></a>
   </p>
 
   <p>
     <a href="#how-it-works">How it works</a> •
     <a href="#examples">Examples</a> •
     <a href="#where-it-helps">Where it helps</a> •
-    <a href="#install-and-use">Install</a> •
+    <a href="#install">Install</a> •
     <a href="#uninstall">Uninstall</a>
   </p>
 </div>
@@ -90,13 +91,45 @@ That suggestion created this repository. Scout found the product hiding next to 
 - **Creative people:** discover stronger angles, formats, constraints, and adjacent ideas
 - **Decision makers:** expose hidden tradeoffs, second-order effects, and better options
 
-## Install and use
+## Install
 
-Run `npx @gomzkov/scout` with Node.js 18 or newer. The zero-dependency installer lets you choose the agent, global or project scope, and Claude Code's always-on or on-demand mode. Existing configuration is preserved.
+Run the interactive installer with Node.js 22 or newer:
 
-- **Claude Code:** type `/scout`, use automatic matching, or enable always-on mode
-- **Cursor:** type `/scout`, use automatic matching, or install the project rule
-- **Codex:** type `$scout` or use automatic matching
+```bash
+npx @gomzkov/scout
+```
+
+Choose:
+
+1. Claude Code, Cursor, Codex, or all three
+2. A global installation or the current project
+3. Always-on or on-demand mode when installing for Claude Code
+
+Running the installer again updates Scout without duplicating configuration. Existing settings and instruction files are preserved.
+
+### Non-interactive install
+
+```bash
+npx @gomzkov/scout install --agent all --scope global --mode on
+```
+
+Available values:
+
+| Option | Values |
+| --- | --- |
+| `--agent` | `claude`, `cursor`, `codex`, `all` |
+| `--scope` | `global`, `project` |
+| `--mode` | `on`, `demand` for Claude Code or `all` |
+
+### Agent behavior
+
+| Agent | Global | Project |
+| --- | --- | --- |
+| Claude Code | Skill plus optional always-on hook | Project skill plus optional always-on hook |
+| Cursor | Personal skill, loaded by matching or `/scout` | Skill plus always-applied project rule |
+| Codex | Skill plus a managed `~/.codex/AGENTS.md` block | Skill plus a managed project `AGENTS.md` block |
+
+Start a new agent session after installing.
 
 ## Uninstall
 
@@ -104,9 +137,29 @@ Run `npx @gomzkov/scout` with Node.js 18 or newer. The zero-dependency installer
 npx @gomzkov/scout uninstall
 ```
 
-Choose the agent and whether to remove the global or project installation. The uninstaller removes only Scout's files. For Claude Code always-on mode, it also removes only Scout's `SessionStart` hook and preserves the rest of your settings.
+For an unattended uninstall:
+
+```bash
+npx @gomzkov/scout uninstall --agent all --scope global --yes
+```
+
+The uninstaller removes only Scout's files, its Claude Code hook, and its marked Codex instruction block. Other hooks, settings, skills, rules, and `AGENTS.md` content stay untouched.
 
 Restart any open agent sessions after uninstalling.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `SCOUT_DISABLE` | `0` | Set to `1` to mute the Claude Code always-on hook without uninstalling |
+
+## Installer safety
+
+- Zero runtime dependencies.
+- No install or postinstall script. Nothing changes until you run the CLI.
+- Writes are atomic and refuse symlinked targets.
+- Install and uninstall are idempotent and preserve unrelated configuration.
+- The package tests global and project flows for all supported agents.
 
 ## High signal by design
 
@@ -116,6 +169,16 @@ Restart any open agent sessions after uninstalling.
 - **Calibrated to you.** Scout skips what you know and searches beyond your current frame.
 
 Edit the installed `SKILL.md` to tune the pointer budget, skip rules, and activity level.
+
+## Development
+
+```bash
+npm ci
+npm test
+npm pack --dry-run
+```
+
+`npm test` compiles the installer and exercises install, update, and uninstall flows inside a temporary directory.
 
 ## License
 

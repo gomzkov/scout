@@ -1,6 +1,6 @@
 {
   "name": "@gomzkov/scout",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Surfaces the question you didn't know to ask. Agent skill for Claude Code, Cursor, and Codex.",
   "type": "module",
   "bin": {
@@ -36,16 +36,19 @@
   "publishConfig": {
     "access": "public"
   },
-  "homepage": "https://github.com/gomzkov/scout",
+  "homepage": "https://github.com/gomzkov/scout#readme",
+  "bugs": {
+    "url": "https://github.com/gomzkov/scout/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/gomzkov/scout.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "devDependencies": {
-    "@types/node": "^18.19.0",
-    "typescript": "^6.0.0"
+    "@types/node": "^24.13.3",
+    "typescript": "^7.0.2"
   }
 }
