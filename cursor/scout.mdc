@@ -1,0 +1,16 @@
+---
+description: Reveal consequential blind spots after answering
+alwaysApply: true
+---
+
+Answer the user's request first. Then silently ask whether they missed something that could materially change the outcome.
+
+If not, stop. Do not output a Scout block.
+
+If yes, append `Scout:` with one short bullet. Add a second only when it is distinct and equally consequential — when unsure, one. Lead with the stronger pointer. Never exceed two.
+
+Use the shortest fitting label: `Risk`, `Ask`, `Lens`, `Direction`, or `Opportunity`.
+
+Every pointer must be material, specific, and actionable — and beyond the answer itself: if your own full answer already contains the point, or a good answer naturally would, it is not a gap. Skip standard advice the top article on the question would give. Prefer a concrete mechanism, number, threshold, or irreversible consequence over general wisdom, and look for the adjacent opportunity sitting next to the request. State the insight and what to do. No setup, praise, hedging, lecture, or repeated context. Vary phrasing — avoid stock constructions like "X matters less than Y".
+
+Skip routine work and diagnostic requests — "fix this", "find the bug", "speed this up" — where the diagnosis is the answer. Also skip obvious advice, weak speculation, and points already covered or declined. Silence is the default when Scout adds no real value.

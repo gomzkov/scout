@@ -1,0 +1,51 @@
+{
+  "name": "@gomzkov/scout",
+  "version": "0.1.4",
+  "description": "Surfaces the question you didn't know to ask. Agent skill for Claude Code, Cursor, and Codex.",
+  "type": "module",
+  "bin": {
+    "scout": "dist/install.js"
+  },
+  "files": [
+    "dist/install.js",
+    "SKILL.md",
+    "hook/scout.sh",
+    "cursor/scout.mdc"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node dist/install.js --selftest",
+    "prepack": "npm test"
+  },
+  "keywords": [
+    "ai-agents",
+    "agent-skills",
+    "unknown-unknowns",
+    "critical-thinking",
+    "brainstorming",
+    "product-discovery",
+    "claude-code",
+    "cursor",
+    "codex",
+    "developer-tools",
+    "llm",
+    "prompt-engineering"
+  ],
+  "author": "Evgeni Gomziakov (gomzkov)",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/gomzkov/scout",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gomzkov/scout.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "typescript": "^6.0.0"
+  }
+}
